@@ -14,6 +14,9 @@
 //
 // Si la validación falla (4 o 5) se borra el archivo de salida para que el
 // orquestador nunca una un fragmento corrupto.
+//
+// Progreso: por stdout se emiten líneas "PROGRESS <bytes_escritos> <bytes_esperados>"
+// cada vez que el avance sube al menos un 1 %, y al terminar una línea "OK ...".
 
 #include <curl/curl.h>
 
@@ -37,6 +40,31 @@ struct RangeInfo {
     long long start;
     long long end;
 };
+
+struct ProgressContext {
+    const WriteContext* write;
+    long long expected;
+    int last_percent;
+};
+
+void report_progress(long long written, long long expected) {
+    std::printf("PROGRESS %s %s\n", std::to_string(written).c_str(),
+                std::to_string(expected).c_str());
+    std::fflush(stdout);  // stdout es un pipe (búfer completo) cuando lo lee el orquestador
+}
+
+// Se usan los bytes ya escritos en disco en lugar de dlnow: dlnow se reinicia
+// en cada redirección y no refleja lo que de verdad contiene el fragmento.
+int xferinfo_callback(void* userp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    ProgressContext* ctx = static_cast<ProgressContext*>(userp);
+    long long written = static_cast<long long>(ctx->write->written);
+    int percent = static_cast<int>(written * 100 / ctx->expected);
+    if (percent > ctx->last_percent) {
+        ctx->last_percent = percent;
+        report_progress(written, ctx->expected);
+    }
+    return 0;  // distinto de 0 abortaría la transferencia
+}
 
 size_t write_callback(char* data, size_t size, size_t nmemb, void* userp) {
     WriteContext* ctx = static_cast<WriteContext*>(userp);
@@ -139,6 +167,7 @@ int main(int argc, char* argv[]) {
     const std::string range = std::to_string(start) + "-" + std::to_string(end);
     WriteContext ctx = {file, 0};
     RangeInfo range_info = {false, 0, 0};
+    ProgressContext progress = {&ctx, expected, -1};
     char errbuf[CURL_ERROR_SIZE] = {0};
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -147,6 +176,9 @@ int main(int argc, char* argv[]) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &range_info);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &progress);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);

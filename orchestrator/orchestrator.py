@@ -4,7 +4,8 @@ Flujo:
   1. Sondea el servidor (petición con Range: bytes=0-0) para conocer el tamaño
      total y saber si admite descargas por rangos.
   2. Divide el archivo en N rangos y lanza una instancia de core_downloader.exe
-     por rango, en paralelo, con reintentos.
+     por rango, en paralelo, con reintentos. Lee en tiempo real las líneas
+     "PROGRESS" que emite cada proceso y muestra una barra de progreso global.
   3. Une los fragmentos en orden, verifica el tamaño final y borra los temporales.
 
 Si el servidor no admite rangos (o dice admitirlos pero no los respeta),
@@ -15,11 +16,11 @@ Uso:
 """
 
 import argparse
-import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -61,6 +62,113 @@ def probe(url):
         return final_url, size, False
 
 
+def format_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+class ProgressBar:
+    """Barra de progreso global en una sola línea, redibujada desde un hilo propio.
+
+    Los hilos de descarga solo actualizan contadores (update); el dibujo se hace
+    a intervalos fijos para no saturar la consola con cientos de líneas PROGRESS.
+    """
+
+    WIDTH = 30
+
+    def __init__(self, total, parts):
+        self.total = total
+        self.done = [0] * parts
+        self.lock = threading.Lock()
+        self.started = time.monotonic()
+        self.last_len = 0
+        # Fuera de una terminal (redirigido a archivo/pipe) se redibuja menos.
+        self.interval = 0.1 if sys.stdout.isatty() else 1.0
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stopped.set()
+        self.thread.join()
+        with self.lock:
+            self._draw()
+            sys.stdout.write("\n")
+
+    def update(self, index, nbytes):
+        with self.lock:
+            self.done[index] = nbytes
+
+    def log(self, message):
+        """Imprime un mensaje encima de la barra sin romperla."""
+        with self.lock:
+            sys.stdout.write("\r" + message.ljust(self.last_len) + "\n")
+            self._draw()
+
+    def _run(self):
+        while not self.stopped.wait(self.interval):
+            with self.lock:
+                self._draw()
+
+    def _draw(self):
+        # Un servidor que no respeta rangos puede enviar de más: se limita al total.
+        done = min(sum(self.done), self.total)
+        fraction = done / self.total
+        filled = int(fraction * self.WIDTH)
+        elapsed = time.monotonic() - self.started
+        speed = done / elapsed if elapsed > 0 else 0
+        eta = f"{(self.total - done) / speed:.0f} s" if speed > 0 else "--"
+        line = (
+            f"[{'█' * filled}{'░' * (self.WIDTH - filled)}] {fraction:6.1%}  "
+            f"{format_bytes(done)}/{format_bytes(self.total)}  "
+            f"{format_bytes(speed)}/s  ETA {eta}"
+        )
+        # Se rellena con espacios para borrar restos de una línea anterior más larga.
+        sys.stdout.write("\r" + line.ljust(self.last_len))
+        sys.stdout.flush()
+        self.last_len = len(line)
+
+
+class ActiveProcesses:
+    """Registro de procesos core_downloader en marcha, para matarlos si se aborta."""
+
+    def __init__(self):
+        self.procs = set()
+        self.lock = threading.Lock()
+        self.aborted = False
+
+    def start(self, args):
+        with self.lock:
+            if self.aborted:
+                raise DownloadError("descarga cancelada")
+            # stderr solo recibe un mensaje corto de error, así que leerlo al final
+            # no puede llenar su pipe y bloquear al proceso.
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",  # main.cpp está en UTF-8 y sus mensajes también
+                errors="replace",
+            )
+            self.procs.add(proc)
+            return proc
+
+    def finished(self, proc):
+        with self.lock:
+            self.procs.discard(proc)
+
+    def kill_all(self):
+        with self.lock:
+            self.aborted = True
+            for proc in self.procs:
+                proc.kill()
+
+
 def split_ranges(total, connections):
     """Divide [0, total) en rangos inclusivos (inicio, fin) de tamaño parecido."""
     parts = max(1, min(connections, total // MIN_PART_SIZE))
@@ -73,24 +181,28 @@ def split_ranges(total, connections):
     return ranges
 
 
-def download_part(exe, url, index, start, end, part_path, retries):
+def download_part(exe, url, index, start, end, part_path, retries, bar, active):
     """Descarga un fragmento con core_downloader, reintentando fallos transitorios."""
     for attempt in range(1, retries + 1):
-        result = subprocess.run(
-            [str(exe), url, str(start), str(end), str(part_path)],
-            capture_output=True,
-            encoding="utf-8",  # main.cpp está en UTF-8 y sus mensajes también
-            errors="replace",
-        )
-        if result.returncode == EXIT_OK:
+        proc =active.start([str(exe), url, str(start), str(end), str(part_path)])
+        try:
+            for line in proc.stdout:  # una línea "PROGRESS <escritos> <esperados>" por cada 1 %
+                if line.startswith("PROGRESS "):
+                    bar.update(index, int(line.split()[1]))
+            message = proc.stderr.read().strip()
+            returncode = proc.wait()
+        finally:
+            active.finished(proc)
+
+        if returncode == EXIT_OK:
             return index
-        message = result.stderr.strip() or result.stdout.strip()
-        if result.returncode not in RETRYABLE_EXITS or attempt == retries:
-            error = f"fragmento {index} ({start}-{end}): código {result.returncode}: {message}"
-            if result.returncode in (EXIT_RANGE_REJECTED, EXIT_SIZE_MISMATCH):
+        if returncode not in RETRYABLE_EXITS or attempt == retries:
+            error = f"fragmento {index} ({start}-{end}): código {returncode}: {message}"
+            if returncode in (EXIT_RANGE_REJECTED, EXIT_SIZE_MISMATCH):
                 raise RangesNotHonored(error)
             raise DownloadError(error)
-        print(f"  fragmento {index}: intento {attempt} falló ({message}); reintentando...", file=sys.stderr)
+        bar.update(index, 0)  # el reintento empieza el fragmento de cero
+        bar.log(f"  fragmento {index}: intento {attempt} falló ({message}); reintentando...")
         time.sleep(attempt)  # espera creciente entre reintentos
 
 
@@ -100,21 +212,23 @@ def download_parallel(exe, url, total, output, connections, retries):
     parts_dir.mkdir(exist_ok=True)
     part_paths = [parts_dir / f"part{i:03d}.tmp" for i in range(len(ranges))]
 
-    print(f"Descargando {total} bytes en {len(ranges)} fragmentos...")
+    parts_label = "1 fragmento" if len(ranges) == 1 else f"{len(ranges)} fragmentos paralelos"
+    print(f"Descargando {format_bytes(total)} en {parts_label}...")
+    active = ActiveProcesses()
     try:
-        with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+        with ProgressBar(total, len(ranges)) as bar, ThreadPoolExecutor(max_workers=len(ranges)) as pool:
             futures = [
-                pool.submit(download_part, exe, url, i, start, end, part_paths[i], retries)
+                pool.submit(download_part, exe, url, i, start, end, part_paths[i], retries, bar, active)
                 for i, (start, end) in enumerate(ranges)
             ]
             try:
-                for done, future in enumerate(as_completed(futures), 1):
-                    index = future.result()
-                    start, end = ranges[index]
-                    print(f"  [{done}/{len(ranges)}] fragmento {index} listo ({end - start + 1} bytes)")
+                for future in as_completed(futures):
+                    future.result()
             except BaseException:
+                # Un fragmento falló sin remedio (o Ctrl+C): se para todo lo demás.
                 for f in futures:
                     f.cancel()
+                active.kill_all()
                 raise
 
         print("Uniendo fragmentos...")
