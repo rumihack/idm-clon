@@ -47,6 +47,11 @@ EXIT_SIZE_MISMATCH = 5
 RETRYABLE_EXITS = {EXIT_NETWORK, EXIT_SIZE_MISMATCH}
 
 
+def console_log(message, error=False):
+    """Destino por defecto de los mensajes: la consola (stderr si es un error)."""
+    print(message, file=sys.stderr if error else sys.stdout)
+
+
 class DownloadError(Exception):
     pass
 
@@ -243,7 +248,7 @@ def download_part(exe, url, index, start, end, part_path, retries, bar, active):
         time.sleep(attempt)  # espera creciente entre reintentos
 
 
-def plan_parts(parts_dir, url, total, validator, connections):
+def plan_parts(parts_dir, url, total, validator, connections, log=console_log):
     """Devuelve (rangos, reanudada): reutiliza el plan guardado si sigue siendo válido."""
     manifest_path = parts_dir / MANIFEST_NAME
     if parts_dir.exists():
@@ -260,7 +265,7 @@ def plan_parts(parts_dir, url, total, validator, connections):
         )
         if same_file:
             return [tuple(r) for r in manifest["ranges"]], True
-        print("Hay fragmentos de otra versión del archivo (o de otra URL): se descartan.")
+        log("Hay fragmentos de otra versión del archivo (o de otra URL): se descartan.")
         shutil.rmtree(parts_dir)
 
     parts_dir.mkdir()
@@ -270,19 +275,23 @@ def plan_parts(parts_dir, url, total, validator, connections):
     return ranges, False
 
 
-def download_parallel(exe, url, final_url, total, validator, output, connections, retries):
+def download_parallel(exe, url, final_url, total, validator, output, connections, retries,
+                      progress=ProgressBar, active=None, log=console_log):
+    """progress: fábrica (total, hechos_por_fragmento) de un objeto con la interfaz de
+    ProgressBar (context manager con update y log). active: ActiveProcesses externo,
+    para poder cancelar desde fuera (la GUI) llamando a kill_all()."""
     parts_dir = output.with_name(output.name + ".parts")
-    ranges, resumed = plan_parts(parts_dir, url, total, validator, connections)
+    ranges, resumed = plan_parts(parts_dir, url, total, validator, connections, log)
     part_paths = [parts_dir / f"part{i:03d}.tmp" for i in range(len(ranges))]
     done = [bytes_on_disk(path, end - start + 1) for path, (start, end) in zip(part_paths, ranges)]
 
     if resumed:
-        print(f"Reanudando: {format_bytes(sum(done))} de {format_bytes(total)} ya descargados.")
+        log(f"Reanudando: {format_bytes(sum(done))} de {format_bytes(total)} ya descargados.")
     parts_label = "1 fragmento" if len(ranges) == 1 else f"{len(ranges)} fragmentos paralelos"
-    print(f"Descargando {format_bytes(total)} en {parts_label}...")
-    active = ActiveProcesses()
+    log(f"Descargando {format_bytes(total)} en {parts_label}...")
+    active = active or ActiveProcesses()
     try:
-        with ProgressBar(total, done) as bar, ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+        with progress(total, done) as bar, ThreadPoolExecutor(max_workers=len(ranges)) as pool:
             futures = [
                 pool.submit(download_part, exe, final_url, i, start, end, part_paths[i], retries, bar, active)
                 for i, (start, end) in enumerate(ranges)
@@ -297,7 +306,7 @@ def download_parallel(exe, url, final_url, total, validator, output, connections
                 active.kill_all()
                 raise
 
-        print("Uniendo fragmentos...")
+        log("Uniendo fragmentos...")
         with open(output, "wb") as out:
             for path in part_paths:
                 with open(path, "rb") as part:
@@ -310,15 +319,15 @@ def download_parallel(exe, url, final_url, total, validator, output, connections
         shutil.rmtree(parts_dir, ignore_errors=True)
         raise
     except BaseException:
-        print(f"Descarga interrumpida. Los fragmentos se conservan en {parts_dir};", file=sys.stderr)
-        print("vuelve a ejecutar el mismo comando para reanudar.", file=sys.stderr)
+        log(f"Descarga interrumpida. Los fragmentos se conservan en {parts_dir};", error=True)
+        log("vuelve a ejecutar el mismo comando para reanudar.", error=True)
         raise
     shutil.rmtree(parts_dir)
 
 
-def download_single(url, output, expected):
+def download_single(url, output, expected, log=console_log):
     """Descarga sin rangos, en una sola conexión (servidores que no los admiten)."""
-    print("El servidor no admite rangos: descargando en una sola conexión...")
+    log("El servidor no admite rangos: descargando en una sola conexión...")
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=20) as response, open(output, "wb") as out:
         shutil.copyfileobj(response, out)
@@ -330,6 +339,38 @@ def download_single(url, output, expected):
 def default_output_name(url):
     name = Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name
     return name or "descarga.bin"
+
+
+def download(url, output=None, output_dir=None, connections=8, retries=3, exe=DEFAULT_EXE,
+             restart=False, progress=ProgressBar, active=None, log=console_log):
+    """Descarga `url` completa y devuelve (ruta_final, bytes, segundos).
+
+    output: ruta del archivo; si falta, se usa el nombre de la URL dentro de
+    output_dir (o del directorio actual). Los demás parámetros opcionales
+    permiten a la GUI sustituir la barra de consola, cancelar y recibir mensajes.
+    """
+    final_url, total, ranges_ok, validator = probe(url)
+    if output is None:
+        output = Path(output_dir or ".") / default_output_name(final_url)
+    output = Path(output).resolve()
+    if restart:
+        shutil.rmtree(output.with_name(output.name + ".parts"), ignore_errors=True)
+    began = time.monotonic()
+
+    if ranges_ok and total > 0:
+        if not Path(exe).is_file():
+            raise DownloadError(f"no se encontró {exe}; ejecuta core_downloader\\build.bat")
+        try:
+            download_parallel(exe, url, final_url, total, validator, output, connections, retries,
+                              progress, active, log)
+        except RangesNotHonored as exc:
+            log(f"Aviso: el servidor no respeta los rangos ({exc}).", error=True)
+            # El tamaño anunciado no es fiable, así que no se verifica.
+            download_single(final_url, output, None, log)
+    else:
+        download_single(final_url, output, total, log)
+
+    return output, output.stat().st_size, time.monotonic() - began
 
 
 def main():
@@ -352,27 +393,8 @@ def main():
         parser.error("--connections y --retries deben ser >= 1")
 
     try:
-        final_url, total, ranges_ok, validator = probe(args.url)
-        output = Path(args.output or default_output_name(final_url)).resolve()
-        if args.restart:
-            shutil.rmtree(output.with_name(output.name + ".parts"), ignore_errors=True)
-        began = time.monotonic()
-
-        if ranges_ok and total > 0:
-            if not args.exe.is_file():
-                raise DownloadError(f"no se encontró {args.exe}; ejecuta core_downloader\\build.bat")
-            try:
-                download_parallel(args.exe, args.url, final_url, total, validator, output,
-                                  args.connections, args.retries)
-            except RangesNotHonored as exc:
-                print(f"Aviso: el servidor no respeta los rangos ({exc}).", file=sys.stderr)
-                # El tamaño anunciado no es fiable, así que no se verifica.
-                download_single(final_url, output, None)
-        else:
-            download_single(final_url, output, total)
-
-        elapsed = time.monotonic() - began
-        size = output.stat().st_size
+        output, size, elapsed = download(args.url, args.output, connections=args.connections,
+                                         retries=args.retries, exe=args.exe, restart=args.restart)
         speed = size / elapsed / 1024 / 1024 if elapsed > 0 else 0
         print(f"OK {output} ({size} bytes en {elapsed:.1f} s, {speed:.2f} MB/s)")
         return 0
