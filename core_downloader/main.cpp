@@ -1,10 +1,14 @@
 // core_downloader: descarga un único fragmento (rango de bytes) de una URL.
 //
 // Uso:
-//   core_downloader <url> <inicio> <fin> <archivo_temporal>
+//   core_downloader <url> <inicio> <fin> <archivo_temporal> [--append]
 //
 // Ejemplo:
 //   core_downloader https://example.com/file.zip 0 1048575 file.zip.part0
+//
+// Con --append los bytes se añaden al final del archivo existente en lugar de
+// sobrescribirlo: así el orquestador reanuda un fragmento a medias pidiendo
+// solo el rango que falta.
 //
 // Códigos de salida:
 //   0 = OK, 1 = argumentos inválidos, 2 = error de archivo,
@@ -12,13 +16,21 @@
 //   4 = el servidor no respetó el rango (no devolvió 206 o Content-Range distinto al pedido),
 //   5 = los bytes recibidos no coinciden con el tamaño del rango
 //
-// Si la validación falla (4 o 5) se borra el archivo de salida para que el
-// orquestador nunca una un fragmento corrupto.
+// La respuesta se valida antes de escribir el primer byte y nunca se escriben
+// más bytes que los del rango, así que todo lo que llega al disco es un prefijo
+// correcto del rango:
+//   - Con 4 o 5 se descarta lo escrito en esta ejecución (se borra el archivo,
+//     o con --append se trunca a su tamaño inicial).
+//   - Con 3 (red caída, proceso interrumpido...) lo escrito se conserva para
+//     poder reanudar.
 //
 // Progreso: por stdout se emiten líneas "PROGRESS <bytes_escritos> <bytes_esperados>"
-// cada vez que el avance sube al menos un 1 %, y al terminar una línea "OK ...".
+// (relativas al rango pedido) cada vez que el avance sube al menos un 1 %, y al
+// terminar una línea "OK ...".
 
 #include <curl/curl.h>
+
+#include <io.h>
 
 #include <cctype>
 #include <cerrno>
@@ -29,11 +41,6 @@
 
 namespace {
 
-struct WriteContext {
-    FILE* file;
-    curl_off_t written;
-};
-
 // Content-Range de la respuesta final (tras seguir redirecciones).
 struct RangeInfo {
     bool present;
@@ -41,11 +48,46 @@ struct RangeInfo {
     long long end;
 };
 
+struct WriteContext {
+    FILE* file;
+    CURL* curl;
+    const RangeInfo* range;
+    long long start;
+    long long end;
+    long long written;
+    bool checked;        // la respuesta ya se validó
+    int error;           // código de salida si la validación falló (4 o 5), si no 0
+    std::string message;
+};
+
 struct ProgressContext {
     const WriteContext* write;
-    long long expected;
     int last_percent;
 };
+
+// Validación 1: el servidor debe devolver 206 con un Content-Range igual al
+// pedido. Con file:// o ftp:// no hay código HTTP (0) ni cabeceras.
+bool check_response(WriteContext* ctx) {
+    ctx->checked = true;
+    long http_code = 0;
+    curl_easy_getinfo(ctx->curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code == 0) return true;
+
+    if (http_code != 206) {
+        ctx->message = "el servidor respondió " + std::to_string(http_code) +
+                       " en lugar de 206; no soporta rangos.";
+    } else if (!ctx->range->present) {
+        ctx->message = "respuesta 206 sin cabecera Content-Range válida.";
+    } else if (ctx->range->start != ctx->start || ctx->range->end != ctx->end) {
+        ctx->message = "se pidió el rango " + std::to_string(ctx->start) + "-" +
+                       std::to_string(ctx->end) + " pero el servidor devolvió " +
+                       std::to_string(ctx->range->start) + "-" + std::to_string(ctx->range->end) + ".";
+    } else {
+        return true;
+    }
+    ctx->error = 4;
+    return false;
+}
 
 void report_progress(long long written, long long expected) {
     std::printf("PROGRESS %s %s\n", std::to_string(written).c_str(),
@@ -57,21 +99,36 @@ void report_progress(long long written, long long expected) {
 // en cada redirección y no refleja lo que de verdad contiene el fragmento.
 int xferinfo_callback(void* userp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
     ProgressContext* ctx = static_cast<ProgressContext*>(userp);
-    long long written = static_cast<long long>(ctx->write->written);
-    int percent = static_cast<int>(written * 100 / ctx->expected);
+    long long expected = ctx->write->end - ctx->write->start + 1;
+    long long written = ctx->write->written;
+    int percent = static_cast<int>(written * 100 / expected);
     if (percent > ctx->last_percent) {
         ctx->last_percent = percent;
-        report_progress(written, ctx->expected);
+        report_progress(written, expected);
     }
     return 0;  // distinto de 0 abortaría la transferencia
 }
 
+// Devolver un valor distinto de los bytes recibidos aborta la transferencia
+// (CURLE_WRITE_ERROR); se usa para no escribir nunca datos no válidos.
 size_t write_callback(char* data, size_t size, size_t nmemb, void* userp) {
     WriteContext* ctx = static_cast<WriteContext*>(userp);
     size_t bytes = size * nmemb;
+
+    if (!ctx->checked && !check_response(ctx)) return 0;
+
+    // Validación 2 (por exceso): el servidor envía más de lo que mide el rango.
+    long long expected = ctx->end - ctx->start + 1;
+    if (ctx->written + static_cast<long long>(bytes) > expected) {
+        ctx->error = 5;
+        ctx->message = "el servidor envía más bytes de los " + std::to_string(expected) +
+                       " que tiene el rango.";
+        return 0;
+    }
+
     size_t out = std::fwrite(data, 1, bytes, ctx->file);
-    ctx->written += static_cast<curl_off_t>(out);
-    return out;  // si out != bytes, libcurl aborta con CURLE_WRITE_ERROR
+    ctx->written += static_cast<long long>(out);
+    return out;
 }
 
 bool starts_with_nocase(const char* text, size_t len, const char* prefix) {
@@ -121,15 +178,17 @@ bool parse_offset(const char* text, long long& value) {
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
-                 "Uso: %s <url> <inicio> <fin> <archivo_temporal>\n"
-                 "  inicio y fin son offsets en bytes, inclusivos (fin >= inicio).\n",
+                 "Uso: %s <url> <inicio> <fin> <archivo_temporal> [--append]\n"
+                 "  inicio y fin son offsets en bytes, inclusivos (fin >= inicio).\n"
+                 "  --append añade al final del archivo en lugar de sobrescribirlo.\n",
                  prog);
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 5) {
+    const bool append = argc == 6 && std::strcmp(argv[5], "--append") == 0;
+    if (argc != 5 && !append) {
         print_usage(argv[0]);
         return 1;
     }
@@ -144,11 +203,14 @@ int main(int argc, char* argv[]) {
     const char* out_path = argv[4];
     const long long expected = end - start + 1;
 
-    FILE* file = std::fopen(out_path, "wb");
+    FILE* file = std::fopen(out_path, append ? "ab" : "wb");
     if (!file) {
         std::perror("Error abriendo archivo de salida");
         return 2;
     }
+    // Tamaño previo, para poder deshacer lo escrito en esta ejecución.
+    _fseeki64(file, 0, SEEK_END);
+    const long long initial_size = _ftelli64(file);
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         std::fprintf(stderr, "Error: no se pudo inicializar libcurl\n");
@@ -165,9 +227,9 @@ int main(int argc, char* argv[]) {
     }
 
     const std::string range = std::to_string(start) + "-" + std::to_string(end);
-    WriteContext ctx = {file, 0};
     RangeInfo range_info = {false, 0, 0};
-    ProgressContext progress = {&ctx, expected, -1};
+    WriteContext ctx = {file, curl, &range_info, start, end, 0, false, 0, std::string()};
+    ProgressContext progress = {&ctx, -1};
     char errbuf[CURL_ERROR_SIZE] = {0};
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -186,53 +248,41 @@ int main(int argc, char* argv[]) {
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
     CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    int code = 0;
+    std::string message;
+    if (ctx.error != 0) {
+        code = ctx.error;
+        message = "Error: " + ctx.message;
+    } else if (res != CURLE_OK) {
+        code = 3;
+        message = std::string("Error de descarga: ") + (errbuf[0] ? errbuf : curl_easy_strerror(res));
+    } else if (!ctx.checked && !check_response(&ctx)) {
+        code = 4;  // respuesta sin cuerpo: no pasó por write_callback
+        message = "Error: " + ctx.message;
+    } else if (ctx.written != expected) {
+        code = 5;
+        message = "Error: se recibieron " + std::to_string(ctx.written) + " bytes pero el rango " +
+                  range + " tiene " + std::to_string(expected) + ".";
+    }
 
     curl_easy_cleanup(curl);
     curl_global_cleanup();
+
+    const bool discard = code == 4 || code == 5;
+    if (discard && append) {
+        std::fflush(file);
+        _chsize_s(_fileno(file), initial_size);
+    }
     std::fclose(file);
+    if (discard && !append) std::remove(out_path);
 
-    if (res != CURLE_OK) {
-        std::fprintf(stderr, "Error de descarga: %s\n", errbuf[0] ? errbuf : curl_easy_strerror(res));
-        return 3;
+    if (code != 0) {
+        std::fprintf(stderr, "%s\n", message.c_str());
+        return code;
     }
 
-    // std::to_string evita %lld, que el msvcrt de MinGW antiguo no soporta.
-    const std::string written = std::to_string(static_cast<long long>(ctx.written));
-
-    // Validación 1: el servidor debe devolver 206 con un Content-Range igual al
-    // pedido. Con file:// o ftp:// no hay código HTTP (0) ni cabeceras.
-    if (http_code != 0) {
-        if (http_code != 206) {
-            std::fprintf(stderr,
-                         "Error: el servidor respondió %ld en lugar de 206; no soporta rangos.\n",
-                         http_code);
-            std::remove(out_path);
-            return 4;
-        }
-        if (!range_info.present) {
-            std::fprintf(stderr, "Error: respuesta 206 sin cabecera Content-Range válida.\n");
-            std::remove(out_path);
-            return 4;
-        }
-        if (range_info.start != start || range_info.end != end) {
-            std::fprintf(stderr, "Error: se pidió el rango %s pero el servidor devolvió %s-%s.\n",
-                         range.c_str(), std::to_string(range_info.start).c_str(),
-                         std::to_string(range_info.end).c_str());
-            std::remove(out_path);
-            return 4;
-        }
-    }
-
-    // Validación 2: los bytes escritos deben coincidir con el tamaño del rango.
-    if (ctx.written != expected) {
-        std::fprintf(stderr, "Error: se recibieron %s bytes pero el rango %s tiene %s.\n",
-                     written.c_str(), range.c_str(), std::to_string(expected).c_str());
-        std::remove(out_path);
-        return 5;
-    }
-
-    std::printf("OK rango=%s bytes=%s archivo=%s\n", range.c_str(), written.c_str(), out_path);
+    std::printf("OK rango=%s bytes=%s archivo=%s\n", range.c_str(),
+                std::to_string(ctx.written).c_str(), out_path);
     return 0;
 }

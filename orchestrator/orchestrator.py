@@ -8,14 +8,21 @@ Flujo:
      "PROGRESS" que emite cada proceso y muestra una barra de progreso global.
   3. Une los fragmentos en orden, verifica el tamaño final y borra los temporales.
 
+Reanudación: los fragmentos se guardan en <salida>.parts/ junto con un
+manifest.json (URL, tamaño, ETag/Last-Modified y rangos). Si la descarga se
+interrumpe (fallo, Ctrl+C, corte de luz...), al repetir el mismo comando se
+reutiliza ese plan y cada fragmento continúa desde el último byte en disco.
+Si el archivo remoto cambió, los fragmentos viejos se descartan.
+
 Si el servidor no admite rangos (o dice admitirlos pero no los respeta),
 descarga el archivo completo en una sola conexión desde Python.
 
 Uso:
-  python orchestrator.py <url> [-o salida] [-n conexiones] [--retries N]
+  python orchestrator.py <url> [-o salida] [-n conexiones] [--retries N] [--restart]
 """
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -30,6 +37,7 @@ from pathlib import Path
 USER_AGENT = "idm-clon-orchestrator/0.1"
 DEFAULT_EXE = Path(__file__).resolve().parent.parent / "core_downloader" / "bin" / "core_downloader.exe"
 MIN_PART_SIZE = 256 * 1024  # no tiene sentido abrir conexiones para trozos diminutos
+MANIFEST_NAME = "manifest.json"
 
 # Códigos de salida de core_downloader (ver core_downloader/main.cpp).
 EXIT_OK = 0
@@ -48,18 +56,23 @@ class RangesNotHonored(DownloadError):
 
 
 def probe(url):
-    """Devuelve (url_final, tamaño_total o None, admite_rangos)."""
+    """Devuelve (url_final, tamaño_total o None, admite_rangos, huella).
+
+    La huella (ETag o, en su defecto, Last-Modified) identifica la versión del
+    archivo remoto, para no mezclar al reanudar fragmentos de versiones distintas.
+    """
     request = urllib.request.Request(url, headers={"Range": "bytes=0-0", "User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=20) as response:
         final_url = response.geturl()
+        validator = response.headers.get("ETag") or response.headers.get("Last-Modified")
         if response.status == 206:
             match = re.match(r"bytes \d+-\d+/(\d+)", response.headers.get("Content-Range", ""))
             if match:
-                return final_url, int(match.group(1)), True
+                return final_url, int(match.group(1)), True, validator
         length = response.headers.get("Content-Length")
         # 200: el servidor ignoró el Range; Content-Length es el tamaño completo.
         size = int(length) if response.status == 200 and length else None
-        return final_url, size, False
+        return final_url, size, False, validator
 
 
 def format_bytes(n):
@@ -78,9 +91,11 @@ class ProgressBar:
 
     WIDTH = 30
 
-    def __init__(self, total, parts):
+    def __init__(self, total, done):
+        """done: bytes ya en disco por fragmento (distintos de 0 al reanudar)."""
         self.total = total
-        self.done = [0] * parts
+        self.done = list(done)
+        self.resumed = sum(done)  # no cuentan para la velocidad de esta sesión
         self.lock = threading.Lock()
         self.started = time.monotonic()
         self.last_len = 0
@@ -121,7 +136,7 @@ class ProgressBar:
         fraction = done / self.total
         filled = int(fraction * self.WIDTH)
         elapsed = time.monotonic() - self.started
-        speed = done / elapsed if elapsed > 0 else 0
+        speed = (done - self.resumed) / elapsed if elapsed > 0 else 0
         eta = f"{(self.total - done) / speed:.0f} s" if speed > 0 else "--"
         line = (
             f"[{'█' * filled}{'░' * (self.WIDTH - filled)}] {fraction:6.1%}  "
@@ -181,14 +196,37 @@ def split_ranges(total, connections):
     return ranges
 
 
+def bytes_on_disk(part_path, size):
+    """Bytes válidos ya descargados de un fragmento de `size` bytes."""
+    have = part_path.stat().st_size if part_path.exists() else 0
+    if have > size:
+        # core_downloader nunca escribe de más, así que esto es un archivo ajeno.
+        part_path.unlink()
+        return 0
+    return have
+
+
 def download_part(exe, url, index, start, end, part_path, retries, bar, active):
-    """Descarga un fragmento con core_downloader, reintentando fallos transitorios."""
+    """Descarga un fragmento con core_downloader, reintentando fallos transitorios.
+
+    Cada intento (y cada reanudación) continúa desde el último byte en disco:
+    core_downloader garantiza que lo escrito es siempre un prefijo válido del rango.
+    """
+    size = end - start + 1
     for attempt in range(1, retries + 1):
-        proc =active.start([str(exe), url, str(start), str(end), str(part_path)])
+        have = bytes_on_disk(part_path, size)
+        bar.update(index, have)
+        if have == size:
+            return index
+
+        args = [str(exe), url, str(start + have), str(end), str(part_path)]
+        if have:
+            args.append("--append")
+        proc = active.start(args)
         try:
             for line in proc.stdout:  # una línea "PROGRESS <escritos> <esperados>" por cada 1 %
                 if line.startswith("PROGRESS "):
-                    bar.update(index, int(line.split()[1]))
+                    bar.update(index, have + int(line.split()[1]))
             message = proc.stderr.read().strip()
             returncode = proc.wait()
         finally:
@@ -201,24 +239,52 @@ def download_part(exe, url, index, start, end, part_path, retries, bar, active):
             if returncode in (EXIT_RANGE_REJECTED, EXIT_SIZE_MISMATCH):
                 raise RangesNotHonored(error)
             raise DownloadError(error)
-        bar.update(index, 0)  # el reintento empieza el fragmento de cero
         bar.log(f"  fragmento {index}: intento {attempt} falló ({message}); reintentando...")
         time.sleep(attempt)  # espera creciente entre reintentos
 
 
-def download_parallel(exe, url, total, output, connections, retries):
-    ranges = split_ranges(total, connections)
-    parts_dir = output.with_name(output.name + ".parts")
-    parts_dir.mkdir(exist_ok=True)
-    part_paths = [parts_dir / f"part{i:03d}.tmp" for i in range(len(ranges))]
+def plan_parts(parts_dir, url, total, validator, connections):
+    """Devuelve (rangos, reanudada): reutiliza el plan guardado si sigue siendo válido."""
+    manifest_path = parts_dir / MANIFEST_NAME
+    if parts_dir.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = None
+        same_file = (
+            isinstance(manifest, dict)
+            and manifest.get("url") == url
+            and manifest.get("total") == total
+            and manifest.get("validator") == validator
+            and isinstance(manifest.get("ranges"), list)
+        )
+        if same_file:
+            return [tuple(r) for r in manifest["ranges"]], True
+        print("Hay fragmentos de otra versión del archivo (o de otra URL): se descartan.")
+        shutil.rmtree(parts_dir)
 
+    parts_dir.mkdir()
+    ranges = split_ranges(total, connections)
+    manifest = {"url": url, "total": total, "validator": validator, "ranges": ranges}
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return ranges, False
+
+
+def download_parallel(exe, url, final_url, total, validator, output, connections, retries):
+    parts_dir = output.with_name(output.name + ".parts")
+    ranges, resumed = plan_parts(parts_dir, url, total, validator, connections)
+    part_paths = [parts_dir / f"part{i:03d}.tmp" for i in range(len(ranges))]
+    done = [bytes_on_disk(path, end - start + 1) for path, (start, end) in zip(part_paths, ranges)]
+
+    if resumed:
+        print(f"Reanudando: {format_bytes(sum(done))} de {format_bytes(total)} ya descargados.")
     parts_label = "1 fragmento" if len(ranges) == 1 else f"{len(ranges)} fragmentos paralelos"
     print(f"Descargando {format_bytes(total)} en {parts_label}...")
     active = ActiveProcesses()
     try:
-        with ProgressBar(total, len(ranges)) as bar, ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+        with ProgressBar(total, done) as bar, ThreadPoolExecutor(max_workers=len(ranges)) as pool:
             futures = [
-                pool.submit(download_part, exe, url, i, start, end, part_paths[i], retries, bar, active)
+                pool.submit(download_part, exe, final_url, i, start, end, part_paths[i], retries, bar, active)
                 for i, (start, end) in enumerate(ranges)
             ]
             try:
@@ -239,9 +305,15 @@ def download_parallel(exe, url, total, output, connections, retries):
 
         if output.stat().st_size != total:
             raise DownloadError(f"tamaño final {output.stat().st_size} distinto del esperado {total}")
-    finally:
-        # Sin soporte de reanudación todavía: los fragmentos no sirven tras un fallo.
+    except RangesNotHonored:
+        # Se pasará a descarga en una sola conexión: los fragmentos no sirven.
         shutil.rmtree(parts_dir, ignore_errors=True)
+        raise
+    except BaseException:
+        print(f"Descarga interrumpida. Los fragmentos se conservan en {parts_dir};", file=sys.stderr)
+        print("vuelve a ejecutar el mismo comando para reanudar.", file=sys.stderr)
+        raise
+    shutil.rmtree(parts_dir)
 
 
 def download_single(url, output, expected):
@@ -269,24 +341,29 @@ def main():
     parser = argparse.ArgumentParser(description="Descarga un archivo en fragmentos paralelos.")
     parser.add_argument("url")
     parser.add_argument("-o", "--output", help="archivo de salida (por defecto, el nombre de la URL)")
-    parser.add_argument("-n", "--connections", type=int, default=8, help="conexiones paralelas (8)")
+    parser.add_argument("-n", "--connections", type=int, default=8, help="conexiones paralelas (8); al reanudar se mantiene el reparto original")
     parser.add_argument("--retries", type=int, default=3, help="intentos por fragmento (3)")
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE, help="ruta a core_downloader.exe")
+    parser.add_argument("--restart", action="store_true",
+                        help="descarta los fragmentos de una descarga anterior y empieza de cero")
     args = parser.parse_args()
 
     if args.connections < 1 or args.retries < 1:
         parser.error("--connections y --retries deben ser >= 1")
 
     try:
-        final_url, total, ranges_ok = probe(args.url)
+        final_url, total, ranges_ok, validator = probe(args.url)
         output = Path(args.output or default_output_name(final_url)).resolve()
+        if args.restart:
+            shutil.rmtree(output.with_name(output.name + ".parts"), ignore_errors=True)
         began = time.monotonic()
 
         if ranges_ok and total > 0:
             if not args.exe.is_file():
                 raise DownloadError(f"no se encontró {args.exe}; ejecuta core_downloader\\build.bat")
             try:
-                download_parallel(args.exe, final_url, total, output, args.connections, args.retries)
+                download_parallel(args.exe, args.url, final_url, total, validator, output,
+                                  args.connections, args.retries)
             except RangesNotHonored as exc:
                 print(f"Aviso: el servidor no respeta los rangos ({exc}).", file=sys.stderr)
                 # El tamaño anunciado no es fiable, así que no se verifica.
