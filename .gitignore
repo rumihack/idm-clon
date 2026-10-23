@@ -1,0 +1,30 @@
+# --- C++ / compilación ---
+build/
+bin/
+*.exe
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.pdb
+*.ilk
+CMakeCache.txt
+CMakeFiles/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- Descargas temporales / fragmentos ---
+*.part
+*.tmp
+
+# --- IDE / SO ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
