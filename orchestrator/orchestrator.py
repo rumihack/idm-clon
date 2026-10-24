@@ -22,10 +22,12 @@ Uso:
 """
 
 import argparse
+import ctypes
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -164,6 +166,7 @@ class ActiveProcesses:
         self.procs = set()
         self.lock = threading.Lock()
         self.aborted = False
+        self.paused = False
 
     def start(self, args):
         with self.lock:
@@ -179,7 +182,65 @@ class ActiveProcesses:
                 errors="replace",
             )
             self.procs.add(proc)
+            if self.paused:
+                self._suspend(proc)
             return proc
+
+    @staticmethod
+    def _suspend(proc):
+        if os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            ntdll = ctypes.windll.ntdll
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            ntdll.NtSuspendProcess.argtypes = [ctypes.c_void_p]
+            ntdll.NtSuspendProcess.restype = ctypes.c_long
+            handle = kernel32.OpenProcess(0x0800, False, proc.pid)
+            if not handle:
+                raise OSError("no se pudo abrir el proceso para pausarlo")
+            try:
+                if ntdll.NtSuspendProcess(handle) != 0:
+                    raise OSError("Windows no pudo pausar el proceso")
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            os.kill(proc.pid, signal.SIGSTOP)
+
+    @staticmethod
+    def _resume(proc):
+        if os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            ntdll = ctypes.windll.ntdll
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+            ntdll.NtResumeProcess.restype = ctypes.c_long
+            handle = kernel32.OpenProcess(0x0800, False, proc.pid)
+            if not handle:
+                raise OSError("no se pudo abrir el proceso para reanudarlo")
+            try:
+                if ntdll.NtResumeProcess(handle) != 0:
+                    raise OSError("Windows no pudo reanudar el proceso")
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            os.kill(proc.pid, signal.SIGCONT)
+
+    def pause_all(self):
+        with self.lock:
+            for proc in self.procs:
+                if proc.poll() is None:
+                    self._suspend(proc)
+            self.paused = True
+
+    def resume_all(self):
+        with self.lock:
+            for proc in self.procs:
+                if proc.poll() is None:
+                    self._resume(proc)
+            self.paused = False
 
     def finished(self, proc):
         with self.lock:
