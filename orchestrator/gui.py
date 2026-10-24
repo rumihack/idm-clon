@@ -10,6 +10,7 @@ Uso:
 """
 
 import ctypes
+import argparse
 import queue
 import sys
 import threading
@@ -362,16 +363,22 @@ def default_download_dir():
     return downloads if downloads.is_dir() else Path.home()
 
 
-def main():
+def main(initial_url=None):
     if sys.platform == "win32":
         try:  # texto nítido en pantallas con escalado
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except (AttributeError, OSError):
             pass
     root = tk.Tk()
-    App(root)
+    app = App(root)
+    if initial_url:
+        app.url_var.set(initial_url)
+        root.after(0, app.on_start)
     root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Interfaz gráfica de idm-clon.")
+    parser.add_argument("url", nargs="?", help="URL opcional para iniciar la descarga")
+    args = parser.parse_args()
+    main(args.url)

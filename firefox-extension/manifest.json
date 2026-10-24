@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "name": "Enviar a idm-clon",
+  "version": "1.0.0",
+  "description": "Envía las descargas de Firefox a idm-clon en este equipo.",
+  "permissions": [
+    "downloads",
+    "http://127.0.0.1:5000/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "idm-clon-local@localhost",
+      "strict_min_version": "91.0"
+    }
+  }
+}
