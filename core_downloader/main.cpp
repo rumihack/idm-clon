@@ -30,7 +30,12 @@
 
 #include <curl/curl.h>
 
+#ifdef _WIN32
 #include <io.h>
+#else
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 #include <cctype>
 #include <cerrno>
@@ -40,6 +45,31 @@
 #include <string>
 
 namespace {
+
+// Abstracciones de posicionamiento y truncado para Windows y POSIX.
+int seek_file(FILE* file, long long offset, int origin) {
+#ifdef _WIN32
+    return _fseeki64(file, offset, origin);
+#else
+    return fseeko(file, static_cast<off_t>(offset), origin);
+#endif
+}
+
+long long tell_file(FILE* file) {
+#ifdef _WIN32
+    return _ftelli64(file);
+#else
+    return static_cast<long long>(ftello(file));
+#endif
+}
+
+int truncate_file(FILE* file, long long size) {
+#ifdef _WIN32
+    return _chsize_s(_fileno(file), size);
+#else
+    return ftruncate(fileno(file), static_cast<off_t>(size));
+#endif
+}
 
 // Content-Range de la respuesta final (tras seguir redirecciones).
 struct RangeInfo {
@@ -209,8 +239,8 @@ int main(int argc, char* argv[]) {
         return 2;
     }
     // Tamaño previo, para poder deshacer lo escrito en esta ejecución.
-    _fseeki64(file, 0, SEEK_END);
-    const long long initial_size = _ftelli64(file);
+    seek_file(file, 0, SEEK_END);
+    const long long initial_size = tell_file(file);
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         std::fprintf(stderr, "Error: no se pudo inicializar libcurl\n");
@@ -272,7 +302,7 @@ int main(int argc, char* argv[]) {
     const bool discard = code == 4 || code == 5;
     if (discard && append) {
         std::fflush(file);
-        _chsize_s(_fileno(file), initial_size);
+        truncate_file(file, initial_size);
     }
     std::fclose(file);
     if (discard && !append) std::remove(out_path);

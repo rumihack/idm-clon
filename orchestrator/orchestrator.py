@@ -23,6 +23,7 @@ Uso:
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -35,7 +36,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 USER_AGENT = "idm-clon-orchestrator/0.1"
-DEFAULT_EXE = Path(__file__).resolve().parent.parent / "core_downloader" / "bin" / "core_downloader.exe"
+CORE_DOWNLOADER_NAME = "core_downloader.exe" if os.name == "nt" else "core_downloader"
+DEFAULT_EXE = (Path(__file__).resolve().parent.parent / "core_downloader" / "bin"
+               / CORE_DOWNLOADER_NAME)
 MIN_PART_SIZE = 256 * 1024  # no tiene sentido abrir conexiones para trozos diminutos
 MANIFEST_NAME = "manifest.json"
 
@@ -384,7 +387,8 @@ def main():
     parser.add_argument("-o", "--output", help="archivo de salida (por defecto, el nombre de la URL)")
     parser.add_argument("-n", "--connections", type=int, default=8, help="conexiones paralelas (8); al reanudar se mantiene el reparto original")
     parser.add_argument("--retries", type=int, default=3, help="intentos por fragmento (3)")
-    parser.add_argument("--exe", type=Path, default=DEFAULT_EXE, help="ruta a core_downloader.exe")
+    parser.add_argument("--exe", type=Path, default=DEFAULT_EXE,
+                        help="ruta al ejecutable core_downloader")
     parser.add_argument("--restart", action="store_true",
                         help="descarta los fragmentos de una descarga anterior y empieza de cero")
     args = parser.parse_args()

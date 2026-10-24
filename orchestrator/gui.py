@@ -1,7 +1,7 @@
 """Interfaz gráfica (tkinter) de idm-clon.
 
 Usa el mismo motor que la línea de comandos (orchestrator.download): la
-descarga corre en un hilo aparte y lanza un core_downloader.exe por fragmento.
+descarga corre en un hilo aparte y lanza un core_downloader por fragmento.
 Los hilos de descarga nunca tocan los widgets; solo actualizan contadores
 (GuiProgress) y dejan mensajes en una cola, que la GUI lee cada 100 ms.
 
