@@ -12,6 +12,8 @@ Uso:
 import ctypes
 import argparse
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -62,8 +64,10 @@ class GuiProgress:
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, audio_dir=None, audio_status=None):
         self.root = root
+        self.audio_dir = Path(audio_dir) if audio_dir else None
+        self.audio_status = Path(audio_status) if audio_status else None
         self.events = queue.Queue()
         self.worker = None
         self.active = None
@@ -290,6 +294,56 @@ class App:
             result = core.download(url, output_dir=out_dir, connections=connections,
                                    progress=lambda total, done: GuiProgress(self, total, done),
                                    active=self.active, log=log)
+            if self.audio_dir and self.audio_status:
+                output, _, elapsed = result
+                while not self.audio_status.exists():
+                    time.sleep(0.2)
+                if self.audio_status.read_text(encoding="ascii").strip() != "0":
+                    raise RuntimeError("No se pudo descargar el flujo de audio de YouTube")
+                audio_files = [
+                    path for path in self.audio_dir.glob("audio.*")
+                    if path.is_file() and path.name != "audio.status"
+                ]
+                if not audio_files:
+                    raise RuntimeError("yt-dlp no generó un archivo de audio")
+                ffmpeg = shutil.which("ffmpeg")
+                if not ffmpeg:
+                    raise RuntimeError("Se necesita ffmpeg para integrar audio y video")
+
+                final_output = output if output.suffix.lower() == ".mp4" else output.with_suffix(".mp4")
+                merged_output = final_output.with_name(final_output.stem + ".with-audio.tmp.mp4")
+                subprocess.run(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-i",
+                        str(output),
+                        "-i",
+                        str(audio_files[0]),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-c",
+                        "copy",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-movflags",
+                        "+faststart",
+                        str(merged_output),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                merged_output.replace(final_output)
+                if output != final_output:
+                    output.unlink(missing_ok=True)
+                shutil.rmtree(self.audio_dir, ignore_errors=True)
+                result = (final_output, final_output.stat().st_size, elapsed)
             self.events.put(("done", result))
         except Exception as exc:  # cualquier fallo se muestra en la GUI
             self.events.put(("failed", exc))
@@ -411,14 +465,14 @@ def default_download_dir():
     return downloads if downloads.is_dir() else Path.home()
 
 
-def main(initial_url=None):
+def main(initial_url=None, audio_dir=None, audio_status=None):
     if sys.platform == "win32":
         try:  # texto nítido en pantallas con escalado
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except (AttributeError, OSError):
             pass
     root = tk.Tk()
-    app = App(root)
+    app = App(root, audio_dir=audio_dir, audio_status=audio_status)
     if initial_url:
         app.url_var.set(initial_url)
         root.after(0, app.on_start)
@@ -428,5 +482,7 @@ def main(initial_url=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interfaz gráfica de idm-clon.")
     parser.add_argument("url", nargs="?", help="URL opcional para iniciar la descarga")
+    parser.add_argument("--audio-dir", help=argparse.SUPPRESS)
+    parser.add_argument("--audio-status", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    main(args.url)
+    main(args.url, args.audio_dir, args.audio_status)
