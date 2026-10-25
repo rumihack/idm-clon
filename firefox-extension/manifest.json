@@ -12,7 +12,7 @@
   },
   "browser_specific_settings": {
     "gecko": {
-      "id": "idm-clon-local@localhost",
+      "id": "idm_clon@rumihack",
       "strict_min_version": "91.0"
     }
   }
