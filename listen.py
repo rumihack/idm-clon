@@ -26,9 +26,7 @@ MAX_BODY = 64 * 1024
 class DownloadRequestHandler(BaseHTTPRequestHandler):
     def _reply(self, status, message):
         body = json.dumps({"message": message}, ensure_ascii=False).encode("utf-8")
-        # Responder 200 también ante errores de procesamiento evita que Firefox
-        # trate la petición local como un fallo de conexión.
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -46,27 +44,51 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if self.path not in ("/", "/download"):
+            self._reply(404, "Ruta no encontrada")
+            return
+
         url = None
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if 0 < length <= MAX_BODY:
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                url = payload.get("url") if isinstance(payload, dict) else None
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-            pass
+            content_length = self.headers.get("Content-Length")
+            if content_length is None:
+                raise ValueError("Tamaño de petición no válido")
+            length = int(content_length)
+            if length < 0:
+                raise ValueError("Tamaño de petición no válido")
+        except ValueError:
+            self._reply(400, "Tamaño de petición no válido")
+            return
+
+        if length > MAX_BODY:
+            self._reply(413, "Tamaño de petición no válido")
+            return
+        if length == 0:
+            self._reply(400, "Tamaño de petición no válido")
+            return
+
+        try:
+            body = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError:
+            self._reply(400, "Codificación UTF-8 no válida")
+            return
+
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            self._reply(400, "JSON no válido")
+            return
+        url = payload.get("url") if isinstance(payload, dict) else None
 
         print("URL RECIBIDA:", url)
-        if self.path not in ("/", "/download"):
-            self._reply(200, "Ruta no encontrada")
-            return
         try:
             if not isinstance(url, str):
-                raise ValueError("Tamaño de petición no válido")
+                raise ValueError("Se requiere una URL http o https")
             parsed = urlparse(url)
             if parsed is None or parsed.scheme not in ("http", "https") or not parsed.netloc:
                 raise ValueError("Se requiere una URL http o https")
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            self._reply(200, str(exc))
+            self._reply(400, str(exc))
             return
 
         try:
@@ -137,7 +159,7 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
             )
         except (OSError, subprocess.CalledProcessError, ValueError, IndexError) as exc:
             detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
-            self._reply(200, f"No se pudo resolver la URL del video: {detail}")
+            self._reply(500, f"No se pudo resolver la URL del video: {detail}")
             return
         self._reply(200, "GUI abierta; descarga iniciada")
 

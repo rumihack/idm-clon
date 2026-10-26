@@ -1,18 +1,45 @@
-browser.downloads.onCreated.addListener((item) => {
+const pendingDownloads = new Set();
+const IDM_REQUEST_TIMEOUT_MS = 10000;
+
+browser.downloads.onCreated.addListener(async (item) => {
   if (!item.url || !/^https?:\/\//i.test(item.url)) {
     return;
   }
 
-  // Cancelar la descarga del navegador para que solo la procese idm-clon.
-  browser.downloads.cancel(item.id).catch(() => {});
+  if (pendingDownloads.has(item.id)) {
+    return;
+  }
+  pendingDownloads.add(item.id);
 
-  fetch("http://127.0.0.1:5000/download", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url: item.url })
-  }).catch((error) => {
-    console.error("No se pudo conectar con idm-clon:", error);
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), IDM_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch("http://127.0.0.1:5000/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: item.url }),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      console.error(`idm-clon rechazó la descarga: HTTP ${response.status}`);
+      return;
+    }
+
+    try {
+      await browser.downloads.cancel(item.id);
+    } catch (error) {
+      console.error("No se pudo cancelar la descarga de Firefox:", error);
+    }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      console.error("Tiempo de espera agotado al conectar con idm-clon:", error);
+    } else {
+      console.error("No se pudo conectar con idm-clon:", error);
+    }
+  } finally {
+    clearTimeout(timeoutId);
+    pendingDownloads.delete(item.id);
+  }
 });
 
 browser.runtime.onMessage.addListener((message) => {

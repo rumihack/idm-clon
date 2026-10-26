@@ -296,6 +296,9 @@ def download_part(exe, url, index, start, end, part_path, retries, bar, active):
             for line in proc.stdout:  # una línea "PROGRESS <escritos> <esperados>" por cada 1 %
                 if line.startswith("PROGRESS "):
                     bar.update(index, have + int(line.split()[1]))
+                elif line.startswith("DIAG "):
+                    bar.log(f"  fragmento {index}: intento {attempt}/{retries} "
+                            f"rango={start + have}-{end}: {line.strip()}")
             message = proc.stderr.read().strip()
             returncode = proc.wait()
         finally:

@@ -279,6 +279,30 @@ int main(int argc, char* argv[]) {
 
     CURLcode res = curl_easy_perform(curl);
 
+    char* remote_ip = nullptr;
+    long remote_port = -1;
+    double connect_time = 0.0, total_time = 0.0;
+    const CURLcode ip_info = curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &remote_ip);
+    const CURLcode port_info = curl_easy_getinfo(curl, CURLINFO_PRIMARY_PORT, &remote_port);
+    const CURLcode connect_info = curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connect_time);
+    const CURLcode total_info = curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total_time);
+    char port_text[32] = "unavailable";
+    char connect_text[64] = "unavailable";
+    char total_text[64] = "unavailable";
+    if (port_info == CURLE_OK && remote_port > 0)
+        std::snprintf(port_text, sizeof(port_text), "%ld", remote_port);
+    // Zero does not establish that a connection was completed.
+    if (connect_info == CURLE_OK && connect_time > 0.0)
+        std::snprintf(connect_text, sizeof(connect_text), "%.6f", connect_time);
+    if (total_info == CURLE_OK && total_time >= 0.0)
+        std::snprintf(total_text, sizeof(total_text), "%.6f", total_time);
+    std::printf("DIAG curl_code=%d description=\"%s\" remote_ip=%s remote_port=%s "
+                "connect_time_s=%s total_time_s=%s\n",
+                static_cast<int>(res), curl_easy_strerror(res),
+                ip_info == CURLE_OK && remote_ip && remote_ip[0] ? remote_ip : "unavailable",
+                port_text, connect_text, total_text);
+    std::fflush(stdout);
+
     int code = 0;
     std::string message;
     if (ctx.error != 0) {
