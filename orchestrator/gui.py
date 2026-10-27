@@ -21,7 +21,15 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-import orchestrator as core
+if __package__:
+    from . import orchestrator as core
+    from . import media, download_job
+    from .selection_dialog import SelectionDialog
+else:
+    import orchestrator as core
+    import media
+    import download_job
+    from selection_dialog import SelectionDialog
 
 THREAD_CHOICES = ("1", "2", "4", "8", "16")
 POLL_MS = 100
@@ -76,6 +84,10 @@ class App:
         self.thread_rows = []
         self.cancelled = False
         self.paused = False
+        self.media_selection = None
+        self.media_cancel = threading.Event()
+        self.selector = None
+        self.closing = False
 
         root.title("idm-clon — Download status")
         root.geometry("760x610")
@@ -227,6 +239,9 @@ class App:
             self.on_cancel()
             return
         url = self.url_var.get().strip()
+        if media.youtube_url(url) and self.media_selection is None:
+            self.open_selector(url)
+            return
         if not url.lower().startswith(("http://", "https://")):
             messagebox.showwarning("idm-clon", "Introduce una URL que empiece por http:// o https://")
             return
@@ -236,6 +251,7 @@ class App:
             return
 
         self.cancelled = False
+        self.media_cancel.clear()
         self.paused = False
         self.progress = None
         self.active = core.ActiveProcesses()
@@ -252,6 +268,26 @@ class App:
         self.worker = threading.Thread(target=self._run_download, args=(url, out_dir, connections),
                                        daemon=True)
         self.worker.start()
+        if self.media_selection is not None:
+            self.pause_btn.configure(state="disabled")
+
+    def open_selector(self, url):
+        if self.selector is not None:
+            return
+        self.root.withdraw()
+
+        def selected(selection):
+            self.selector = None
+            if selection is None:
+                self.root.destroy()
+                return
+            self.media_selection = selection
+            self.url_var.set(url)
+            self.dir_var.set(str(selection[1].parent))
+            self.root.deiconify()
+            self.on_start()
+
+        self.selector = SelectionDialog(self.root, url, self.dir_var.get(), selected)
 
     def toggle_pause(self):
         if self.worker is None or self.active is None:
@@ -274,6 +310,7 @@ class App:
         if self.worker is None:
             return
         self.cancelled = True
+        self.media_cancel.set()
         if self.audio_dir and self.audio_dir.is_dir():
             (self.audio_dir / "cancel").touch()
         self.cancel_btn.configure(state="disabled", text="Canceling…")
@@ -283,14 +320,27 @@ class App:
 
     def on_close(self):
         if self.worker is not None:
-            if not messagebox.askyesno("idm-clon", "Hay una descarga en curso. ¿Cancelarla y salir?\n"
-                                       "Los fragmentos se conservan para reanudar más tarde."):
+            detail = ("Los temporales de esta descarga se eliminarán." if self.media_selection is not None
+                      else "Los fragmentos se conservan para reanudar más tarde.")
+            if not messagebox.askyesno("idm-clon", "Hay una descarga en curso. ¿Cancelarla y salir?\n" + detail):
+                return
+            if self.media_selection is not None:
+                self.closing = True
+                self.on_cancel()
+                self.stats_var.set("Cancelando y limpiando archivos temporales…")
+                self.root.after(100, self._close_when_stopped)
                 return
             self.active.kill_all()
         self.cancelled = True
         self._stop_merge()
         self._release_audio()
         self.root.destroy()
+
+    def _close_when_stopped(self):
+        if self.worker is not None and self.worker.is_alive():
+            self.root.after(100, self._close_when_stopped)
+        else:
+            self.root.destroy()
 
     def _stop_merge(self):
         process = self.merge_process
@@ -317,6 +367,13 @@ class App:
         try:
             if self.cancelled:
                 raise RuntimeError("Descarga cancelada")
+            if getattr(self, "media_selection", None) is not None:
+                choice, target = self.media_selection
+                result = download_job.download_mp4(
+                    url, choice, target, self.media_cancel, core, self.active, connections,
+                    lambda total, done: GuiProgress(self, total, done), log)
+                self.events.put(("done", result))
+                return
             result = core.download(url, output_dir=out_dir, connections=connections,
                                    progress=lambda total, done: GuiProgress(self, total, done),
                                    active=self.active, log=log)
@@ -425,6 +482,8 @@ class App:
             self.log(event[1], "error" if event[2] else None)
             if event[1].startswith("Uniendo"):
                 self.stats_var.set("Uniendo fragmentos…")
+            elif event[1].startswith(("Actualizando", "Descargando la pista", "Combinando")):
+                self.stats_var.set(event[1])
         elif kind == "done":
             output, size, elapsed = event[1]
             if self.progress is not None:
@@ -439,9 +498,13 @@ class App:
             self.log(f"OK {output} ({size} bytes)", "ok")
         elif kind == "failed":
             exc = event[1]
+            was_media = self.media_selection is not None
             self._finish()
+            if self.closing:
+                return
             if self.cancelled:
-                self.stats_var.set("Cancelado. Pulsa Iniciar Descarga para reanudar.")
+                self.stats_var.set("Cancelado. Puedes seleccionar de nuevo para reintentar." if was_media
+                                   else "Cancelado. Pulsa Iniciar Descarga para reanudar.")
                 self.log("Descarga cancelada por el usuario.", "error")
             else:
                 self.stats_var.set("Error en la descarga.")
@@ -502,6 +565,9 @@ class App:
         self.worker = None
         self.paused = False
         self._set_busy(False)
+        if self.media_selection is not None:
+            self.media_selection = None
+            self.stats_var.set("Selecciona de nuevo para otra descarga o reintento.")
 
     def _set_busy(self, busy):
         state = "disabled" if busy else "normal"
@@ -524,7 +590,7 @@ def default_download_dir():
     return downloads if downloads.is_dir() else Path.home()
 
 
-def main(initial_url=None, audio_dir=None, audio_status=None):
+def main(initial_url=None, audio_dir=None, audio_status=None, select_youtube=False):
     if sys.platform == "win32":
         try:  # texto nítido en pantallas con escalado
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -534,7 +600,10 @@ def main(initial_url=None, audio_dir=None, audio_status=None):
     app = App(root, audio_dir=audio_dir, audio_status=audio_status)
     if initial_url:
         app.url_var.set(initial_url)
-        root.after(0, app.on_start)
+        if select_youtube or media.youtube_url(initial_url):
+            root.after(0, lambda: app.open_selector(initial_url))
+        else:
+            root.after(0, app.on_start)
     root.mainloop()
 
 
@@ -543,5 +612,6 @@ if __name__ == "__main__":
     parser.add_argument("url", nargs="?", help="URL opcional para iniciar la descarga")
     parser.add_argument("--audio-dir", help=argparse.SUPPRESS)
     parser.add_argument("--audio-status", help=argparse.SUPPRESS)
+    parser.add_argument("--select-youtube", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    main(args.url, args.audio_dir, args.audio_status)
+    main(args.url, args.audio_dir, args.audio_status, args.select_youtube)
