@@ -70,6 +70,7 @@ class App:
         self.audio_status = Path(audio_status) if audio_status else None
         self.events = queue.Queue()
         self.worker = None
+        self.merge_process = None
         self.active = None
         self.progress = None
         self.thread_rows = []
@@ -273,9 +274,12 @@ class App:
         if self.worker is None:
             return
         self.cancelled = True
+        if self.audio_dir and self.audio_dir.is_dir():
+            (self.audio_dir / "cancel").touch()
         self.cancel_btn.configure(state="disabled", text="Canceling…")
         self.pause_btn.configure(state="disabled")
         self.active.kill_all()
+        self._stop_merge()
 
     def on_close(self):
         if self.worker is not None:
@@ -283,26 +287,57 @@ class App:
                                        "Los fragmentos se conservan para reanudar más tarde."):
                 return
             self.active.kill_all()
+        self.cancelled = True
+        self._stop_merge()
+        self._release_audio()
         self.root.destroy()
+
+    def _stop_merge(self):
+        process = self.merge_process
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    def _release_audio(self):
+        if self.audio_dir and self.audio_dir.is_dir():
+            try:
+                (self.audio_dir / "release").touch()
+            except OSError:
+                pass
 
     def _run_download(self, url, out_dir, connections):
         """Hilo de trabajo: no toca widgets, solo encola eventos."""
         def log(message, error=False):
             self.events.put(("log", message, error))
 
+        merged_output = None
         try:
+            if self.cancelled:
+                raise RuntimeError("Descarga cancelada")
             result = core.download(url, output_dir=out_dir, connections=connections,
                                    progress=lambda total, done: GuiProgress(self, total, done),
                                    active=self.active, log=log)
             if self.audio_dir and self.audio_status:
                 output, _, elapsed = result
+                deadline = time.monotonic() + 3600
                 while not self.audio_status.exists():
+                    if self.cancelled:
+                        raise RuntimeError("Descarga cancelada")
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Tiempo de espera del audio agotado")
                     time.sleep(0.2)
+                if self.cancelled:
+                    raise RuntimeError("Descarga cancelada")
                 if self.audio_status.read_text(encoding="ascii").strip() != "0":
-                    raise RuntimeError("No se pudo descargar el flujo de audio de YouTube")
+                    error_log = self.audio_dir / "audio.stderr.log"
+                    detail = error_log.read_text(encoding="utf-8", errors="replace")[-4000:] if error_log.exists() else ""
+                    raise RuntimeError("No se pudo descargar el flujo de audio de YouTube: " + detail)
                 audio_files = [
                     path for path in self.audio_dir.glob("audio.*")
-                    if path.is_file() and path.name != "audio.status"
+                    if path.is_file() and path.suffix.lower() in (".m4a", ".webm", ".mp4", ".opus", ".ogg", ".aac", ".mp3")
                 ]
                 if not audio_files:
                     raise RuntimeError("yt-dlp no generó un archivo de audio")
@@ -312,7 +347,7 @@ class App:
 
                 final_output = output if output.suffix.lower() == ".mp4" else output.with_suffix(".mp4")
                 merged_output = final_output.with_name(final_output.stem + ".with-audio.tmp.mp4")
-                subprocess.run(
+                merge_process = subprocess.Popen(
                     [
                         ffmpeg,
                         "-y",
@@ -334,19 +369,43 @@ class App:
                         "+faststart",
                         str(merged_output),
                     ],
-                    check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     text=True,
                 )
+                self.merge_process = merge_process
+                merge_deadline = time.monotonic() + 600
+                try:
+                    while True:
+                        if self.cancelled or time.monotonic() >= merge_deadline:
+                            raise RuntimeError("Combinación cancelada o tiempo de FFmpeg agotado")
+                        try:
+                            _, merge_error = merge_process.communicate(timeout=0.2)
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                    if merge_process.returncode:
+                        raise RuntimeError("FFmpeg: " + merge_error[-4000:])
+                finally:
+                    if merge_process.poll() is None:
+                        merge_process.kill()
+                    merge_process.communicate()
+                    self.merge_process = None
                 merged_output.replace(final_output)
                 if output != final_output:
                     output.unlink(missing_ok=True)
-                shutil.rmtree(self.audio_dir, ignore_errors=True)
                 result = (final_output, final_output.stat().st_size, elapsed)
             self.events.put(("done", result))
         except Exception as exc:  # cualquier fallo se muestra en la GUI
+            if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+                exc = RuntimeError("FFmpeg: " + exc.stderr[-4000:])
             self.events.put(("failed", exc))
+        finally:
+            try:
+                if merged_output is not None:
+                    merged_output.unlink(missing_ok=True)
+            finally:
+                self._release_audio()
 
     # ---------- sondeo y dibujo (hilo de la GUI) ----------
 
